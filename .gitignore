@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated / local-only artifacts
+analytics_report.html
+active_session.json
+.gmatclub_uc_profile/
+score_report_master_v2.csv
+used_questions.json
+
+# Scraped data & built question banks (contain gmatclub.com content)
+gmatclub.csv
+gmatclub_clean_*.csv
+questions_*_v1.json
+
+# Per-session reports
+*_reports/
