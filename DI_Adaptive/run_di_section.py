@@ -65,6 +65,7 @@ from engine.exclusion import (  # noqa: E402
     filter_available_questions,
 )
 from engine.score_report import append_score_report  # noqa: E402
+from engine.error_log import append_wrong_questions  # noqa: E402
 
 try:
     import undetected_chromedriver as uc
@@ -112,6 +113,7 @@ USED_QUESTIONS_LEDGER_PATH = BASE_DIR / "used_questions.json"
 ACTIVE_SESSION_PATH = BASE_DIR / "active_session.json"
 REPORTS_DIR = BASE_DIR / "di_reports"
 MASTER_CSV_PATH = ROOT_DIR / "score_report_master_v2.csv"
+WRONG_QUESTIONS_PATH = ROOT_DIR / "wrong_questions_master.xlsx"
 CHROME_PROFILE_DIR = ROOT_DIR / ".gmatclub_uc_profile"
 
 ANSWER_WAIT_POLL_SECONDS = 1.0
@@ -325,6 +327,70 @@ def choose_blueprint() -> Tuple[Dict[str, int], Dict[str, int]]:
         return dict(STANDARD_CATEGORY_QUOTAS), dict(STANDARD_SUBTOPIC_QUOTAS)
     print("Blueprint: Extended MSR (DS 6 / Graphs & Tables 5 / MSRs 6 / Two-Part 3)")
     return dict(EXTENDED_CATEGORY_QUOTAS), dict(EXTENDED_SUBTOPIC_QUOTAS)
+
+
+# Menu options for practicing a single category or any combination of them,
+# instead of always drawing the full randomized official blueprint.
+DI_CATEGORY_MENU: Dict[str, str] = {
+    "1": "Data Sufficiency",
+    "2": GRAPHS_AND_TABLES_CATEGORY,
+    "3": MSR_CATEGORY,
+    "4": "Two-Part Analysis",
+}
+
+
+def prompt_category_selection() -> Optional[List[str]]:
+    """Ask which DI category/categories to practice. None means "use the official randomized blueprint"."""
+    print("\nWhich DI question types do you want to practice?")
+    print("  [1] Data Sufficiency")
+    print("  [2] Graphs and Tables (Graphics Interpretation + Table Analysis)")
+    print("  [3] Multi-Source Reasoning (MSR)")
+    print("  [4] Two-Part Analysis")
+    print("  [5] All (randomized official blueprint - default)")
+    raw = input("Enter one or more numbers separated by commas (e.g. 1,3), or 5/blank for all: ").strip()
+    if not raw or raw == "5":
+        return None
+
+    selected: List[str] = []
+    for token in raw.split(","):
+        category = DI_CATEGORY_MENU.get(token.strip())
+        if category and category not in selected:
+            selected.append(category)
+
+    if not selected:
+        print("No valid selection recognized; defaulting to All.")
+        return None
+    return selected
+
+
+def prompt_question_count(default: int) -> int:
+    raw = input(f"Number of questions (default {default}): ").strip()
+    return int(raw) if raw else default
+
+
+def build_custom_blueprint(
+    selected_categories: List[str], total_questions: int
+) -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Split total_questions evenly across the chosen categories (extra remainder to the first ones)."""
+    n = len(selected_categories)
+    base, remainder = divmod(total_questions, n)
+    category_quotas = {
+        cat: base + (1 if i < remainder else 0)
+        for i, cat in enumerate(selected_categories)
+    }
+
+    subtopic_quotas: Dict[str, int] = {}
+    if GRAPHS_AND_TABLES_CATEGORY in category_quotas:
+        gt_quota = category_quotas[GRAPHS_AND_TABLES_CATEGORY]
+        graphics = gt_quota // 2
+        subtopic_quotas = {
+            "Graphics Interpretation": graphics,
+            "Table Analysis": gt_quota - graphics,
+        }
+
+    label = ", ".join(f"{cat} {qty}" for cat, qty in category_quotas.items())
+    print(f"Custom blueprint: {label}")
+    return category_quotas, subtopic_quotas
 
 
 # ===========================================================================
@@ -681,6 +747,10 @@ def finalize_and_report(
         diagnostics=final_result,
     )
 
+    wrong_count = append_wrong_questions(WRONG_QUESTIONS_PATH, session_id, SECTION_NAME, diagnostics_log)
+    if wrong_count:
+        print(f"Logged {wrong_count} missed question(s) to {WRONG_QUESTIONS_PATH}")
+
     return final_result
 
 
@@ -715,11 +785,17 @@ def main() -> None:
         diagnostics_log = []
         subtopic_answered = {}
         starting_percentile = prompt_start_params()
-        category_quotas, subtopic_quotas = choose_blueprint()
+        selected_categories = prompt_category_selection()
+        if selected_categories is None:
+            category_quotas, subtopic_quotas = choose_blueprint()
+            total_questions = TOTAL_QUESTIONS
+        else:
+            total_questions = prompt_question_count(TOTAL_QUESTIONS)
+            category_quotas, subtopic_quotas = build_custom_blueprint(selected_categories, total_questions)
         section = new_section_state(
             section_name=SECTION_NAME,
             category_quotas=category_quotas,
-            total_questions=TOTAL_QUESTIONS,
+            total_questions=total_questions,
             seed_overall_percentile=starting_percentile,
         )
 
@@ -747,6 +823,9 @@ def main() -> None:
             if final_result["early_easy_medium_miss"]:
                 print("Note: An early easy/medium miss capped your maximum possible score.")
             clear_active_session()
+
+            import analytics_dashboard
+            analytics_dashboard.generate_dashboard(section=SECTION_NAME, open_in_browser=True)
         except NoSuchWindowException:
             print("Chrome window was closed. Please keep the browser open while the session runs. Exiting cleanly.")
             return

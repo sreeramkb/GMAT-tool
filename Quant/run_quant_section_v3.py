@@ -55,6 +55,7 @@ from engine.exclusion import (  # noqa: E402
     filter_available_questions,
 )
 from engine.score_report import append_score_report  # noqa: E402
+from engine.error_log import append_wrong_questions  # noqa: E402
 
 try:
     import undetected_chromedriver as uc
@@ -86,6 +87,7 @@ USED_QUESTIONS_LEDGER_PATH = BASE_DIR / "used_questions.json"
 ACTIVE_SESSION_PATH = BASE_DIR / "active_session.json"
 REPORTS_DIR = BASE_DIR / "quant_reports"
 MASTER_CSV_PATH = ROOT_DIR / "score_report_master_v2.csv"
+WRONG_QUESTIONS_PATH = ROOT_DIR / "wrong_questions_master.xlsx"
 CHROME_PROFILE_DIR = ROOT_DIR / ".gmatclub_uc_profile"
 
 ANSWER_WAIT_POLL_SECONDS = 1.0
@@ -295,6 +297,53 @@ def prompt_start_params() -> tuple[float, int]:
     question_count = int(count_raw) if count_raw else TOTAL_QUESTIONS
 
     return starting_percentile, question_count
+
+
+# Menu options for practicing a single Quant category or any combination of
+# them, instead of always drawing the full official quota mix.
+QUANT_CATEGORY_MENU: Dict[str, str] = {
+    "1": "Counting/Sets/Series/Prob/Stats",
+    "2": "Rates/Ratio/Percent",
+    "3": "Equal/Unequal/ALG",
+    "4": "Value/Order/Factors",
+}
+
+
+def prompt_category_selection() -> Optional[List[str]]:
+    """Ask which Quant category/categories to practice. None means "use the official quota mix"."""
+    print("\nWhich Quant question types do you want to practice?")
+    print("  [1] Counting/Sets/Series/Prob/Stats")
+    print("  [2] Rates/Ratio/Percent")
+    print("  [3] Equal/Unequal/ALG")
+    print("  [4] Value/Order/Factors")
+    print("  [5] All (official quota mix - default)")
+    raw = input("Enter one or more numbers separated by commas (e.g. 1,3), or 5/blank for all: ").strip()
+    if not raw or raw == "5":
+        return None
+
+    selected: List[str] = []
+    for token in raw.split(","):
+        category = QUANT_CATEGORY_MENU.get(token.strip())
+        if category and category not in selected:
+            selected.append(category)
+
+    if not selected:
+        print("No valid selection recognized; defaulting to All.")
+        return None
+    return selected
+
+
+def build_custom_category_quotas(selected_categories: List[str], total_questions: int) -> Dict[str, int]:
+    """Split total_questions evenly across the chosen categories (extra remainder to the first ones)."""
+    n = len(selected_categories)
+    base, remainder = divmod(total_questions, n)
+    quotas = {
+        cat: base + (1 if i < remainder else 0)
+        for i, cat in enumerate(selected_categories)
+    }
+    label = ", ".join(f"{cat} {qty}" for cat, qty in quotas.items())
+    print(f"Custom category mix: {label}")
+    return quotas
 
 
 # ===========================================================================
@@ -589,6 +638,10 @@ def finalize_and_report(
         diagnostics=final_result,
     )
 
+    wrong_count = append_wrong_questions(WRONG_QUESTIONS_PATH, session_id, SECTION_NAME, diagnostics_log)
+    if wrong_count:
+        print(f"Logged {wrong_count} missed question(s) to {WRONG_QUESTIONS_PATH}")
+
     return final_result
 
 
@@ -618,9 +671,14 @@ def main() -> None:
         elapsed_thinking_seconds = 0.0
         diagnostics_log = []
         starting_percentile, question_count = prompt_start_params()
+        selected_categories = prompt_category_selection()
+        category_quotas = (
+            CATEGORY_QUOTAS if selected_categories is None
+            else build_custom_category_quotas(selected_categories, question_count)
+        )
         section = new_section_state(
             section_name=SECTION_NAME,
-            category_quotas=CATEGORY_QUOTAS,
+            category_quotas=category_quotas,
             total_questions=question_count,
             seed_overall_percentile=starting_percentile,
         )
@@ -648,6 +706,9 @@ def main() -> None:
             if final_result["early_easy_medium_miss"]:
                 print("Note: An early easy/medium miss capped your maximum possible score.")
             clear_active_session()
+
+            import analytics_dashboard
+            analytics_dashboard.generate_dashboard(section=SECTION_NAME, open_in_browser=True)
         except NoSuchWindowException:
             print("Chrome window was closed. Please keep the browser open while the session runs. Exiting cleanly.")
             return

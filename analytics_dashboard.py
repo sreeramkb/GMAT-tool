@@ -86,9 +86,10 @@ def normalize_session(raw: dict, section: str, file_path: Path) -> Optional[Dict
     }
 
 
-def load_sessions() -> List[Dict[str, Any]]:
+def load_sessions(section: Optional[str] = None) -> List[Dict[str, Any]]:
     sessions: List[Dict[str, Any]] = []
-    for section, directory in REPORT_DIRS.items():
+    dirs = REPORT_DIRS if section is None else {section: REPORT_DIRS[section]}
+    for section_name, directory in dirs.items():
         if not directory.exists():
             continue
         for file_path in sorted(directory.glob("*.json")):
@@ -96,7 +97,7 @@ def load_sessions() -> List[Dict[str, Any]]:
                 raw = json.loads(file_path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, OSError):
                 continue
-            normalized = normalize_session(raw, section, file_path)
+            normalized = normalize_session(raw, section_name, file_path)
             if normalized:
                 sessions.append(normalized)
 
@@ -144,8 +145,13 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
 
-<h1>GMAT Simulator — Analytics Dashboard</h1>
+<h1>GMAT Simulator — Analytics Dashboard__TITLE_SUFFIX__</h1>
 <div class="subtitle">Diagnostic report, not an official score prediction.</div>
+
+<div class="panel" id="trend-panel">
+  <h3 style="margin-top:0;">Level Over Time (all sessions, oldest → newest)</h3>
+  <canvas id="trend-canvas" width="900" height="220"></canvas>
+</div>
 
 <div class="panel" id="selector-panel">
   <label for="session-select">Session:</label>
@@ -168,6 +174,7 @@ function fmtTimestamp(ts) {
 function populateSelector() {
     if (SESSIONS.length === 0) {
         document.getElementById('selector-panel').style.display = 'none';
+        document.getElementById('trend-panel').style.display = 'none';
         contentEl.innerHTML = '<div class="empty-state">No session reports found yet. Complete a section to see analytics here.</div>';
         return;
     }
@@ -325,6 +332,54 @@ function attachSortHandlers(session) {
     });
 }
 
+function drawTrendChart() {
+    const canvas = document.getElementById('trend-canvas');
+    if (!canvas) return;
+    const history = [...SESSIONS].reverse(); // oldest -> newest
+    const ctx = canvas.getContext('2d');
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    if (history.length === 0) return;
+
+    const padding = 40;
+    const n = Math.max(history.length, 1);
+    const xStep = (w - padding * 2) / Math.max(n - 1, 1);
+
+    function plot(values, color, minV, maxV) {
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        values.forEach((v, i) => {
+            if (v == null) return;
+            const x = padding + i * xStep;
+            const y = h - padding - ((v - minV) / (maxV - minV || 1)) * (h - padding * 2);
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            ctx.fillStyle = color;
+            ctx.fillRect(x - 2, y - 2, 4, 4);
+        });
+        ctx.stroke();
+    }
+
+    ctx.strokeStyle = '#444';
+    ctx.beginPath();
+    ctx.moveTo(padding, padding); ctx.lineTo(padding, h - padding); ctx.lineTo(w - padding, h - padding);
+    ctx.stroke();
+
+    const scores = history.map(s => s.scaled_score);
+    const accuracyPct = history.map(s => s.accuracy != null ? s.accuracy * 100 : null);
+    const scoreVals = scores.filter(v => v != null);
+    const minScore = scoreVals.length ? Math.min(...scoreVals) - 2 : 0;
+    const maxScore = scoreVals.length ? Math.max(...scoreVals) + 2 : 100;
+
+    plot(scores, '#4f9dff', minScore, maxScore);
+    plot(accuracyPct, '#f5a623', 0, 100);
+
+    ctx.fillStyle = '#4f9dff';
+    ctx.fillText('scaled score', padding, 16);
+    ctx.fillStyle = '#f5a623';
+    ctx.fillText('accuracy %', padding + 110, 16);
+}
+
 function renderSession(session) {
     contentEl.innerHTML = renderSummary(session) + renderChart(session) + renderCategoryBars(session) + renderTable(session);
     const canvas = document.getElementById('trajectory-canvas');
@@ -333,25 +388,31 @@ function renderSession(session) {
 }
 
 populateSelector();
+drawTrendChart();
 </script>
 </body>
 </html>
 """
 
 
-def render_html(sessions: List[Dict[str, Any]]) -> str:
+def render_html(sessions: List[Dict[str, Any]], section: Optional[str] = None) -> str:
     sessions_json = json.dumps(sessions, default=str).replace("</script", "<\\/script")
-    return _HTML_TEMPLATE.replace("__SESSIONS_JSON__", sessions_json)
+    title_suffix = f" — {section}" if section else ""
+    html = _HTML_TEMPLATE.replace("__SESSIONS_JSON__", sessions_json)
+    return html.replace("__TITLE_SUFFIX__", title_suffix)
 
 
-def generate_dashboard(open_in_browser: bool = True) -> Path:
-    sessions = load_sessions()
-    html = render_html(sessions)
-    OUTPUT_PATH.write_text(html, encoding="utf-8")
-    print(f"Wrote {OUTPUT_PATH} ({len(sessions)} session(s))")
+def generate_dashboard(section: Optional[str] = None, open_in_browser: bool = True) -> Path:
+    """Generate the dashboard. Pass a section name ("Quant"/"DI"/"Verbal") to
+    produce a section-specific file instead of the combined all-sections one."""
+    sessions = load_sessions(section)
+    html = render_html(sessions, section)
+    output_path = OUTPUT_PATH if section is None else ROOT_DIR / f"analytics_report_{section.lower()}.html"
+    output_path.write_text(html, encoding="utf-8")
+    print(f"Wrote {output_path} ({len(sessions)} session(s))")
     if open_in_browser:
-        webbrowser.open(OUTPUT_PATH.as_uri())
-    return OUTPUT_PATH
+        webbrowser.open(output_path.as_uri())
+    return output_path
 
 
 if __name__ == "__main__":
