@@ -153,44 +153,191 @@ def auto_start_timer(driver: Any) -> bool:
 
 _INSTALL_SUBMISSION_INTERCEPTOR_JS = """
 window.__gmat_result = window.__gmat_result || null;
+window.__gmat_user_choice = window.__gmat_user_choice || null;
+window.__gmat_question_key = window.__gmat_question_key || window.location.href;
+window.__gmat_question_started_at = window.__gmat_question_started_at || Date.now();
+
+const currentQuestionKey = () => window.location.href;
+const setCurrentQuestionContext = () => {
+    window.__gmat_question_key = currentQuestionKey();
+    window.__gmat_question_started_at = Date.now();
+    window.__gmat_result = null;
+    window.__gmat_user_choice = null;
+};
+
+setCurrentQuestionContext();
 
 if (typeof window.timer_answer === 'function' && !window.__gmat_sim_patched) {
     const original = window.timer_answer;
     window.timer_answer = function(choiceCode) {
-        window.__gmat_user_choice = choiceCode;
+        if (window.__gmat_question_key !== currentQuestionKey()) return original.apply(this, arguments);
+        const norm = normalizeChoice(choiceCode);
+        if (!norm) return original.apply(this, arguments);
+        window.__gmat_user_choice = norm;
         const result = original.apply(this, arguments);
-        const optionsContainer = document.querySelector('#timer_abcde');
-        if (optionsContainer) {
-            optionsContainer.style.opacity = '0';
-            optionsContainer.style.pointerEvents = 'none';
-        }
+        window.__gmat_result = {
+            correct_choice: null,
+            selected_choice: norm,
+            was_correct: null,
+        };
         return result;
     };
     window.__gmat_sim_patched = true;
 }
 
-const target = document.querySelector('#timer_abcde');
+const normalizeChoice = (value) => {
+    if (!value) return null;
+    const s = String(value).trim();
+    const upper = s.toUpperCase();
+
+    if (/^[A-E]$/.test(upper)) return upper;
+
+    const singleNumber = upper.match(/^([1-5])$/);
+    if (singleNumber) return ['A', 'B', 'C', 'D', 'E'][Number(singleNumber[1]) - 1];
+
+    const flat = upper.replace(/[^0-9]/g, '');
+    if (/^[1-5]$/.test(flat)) return ['A', 'B', 'C', 'D', 'E'][Number(flat) - 1];
+
+    return null;
+};
+
+const extractChoiceFromElement = (el) => {
+    if (!el) return null;
+    const candidates = [
+        el.getAttribute('data-answer'),
+        el.getAttribute('data-choice'),
+        el.getAttribute('value'),
+        el.getAttribute('id'),
+        el.getAttribute('name'),
+        el.getAttribute('aria-label'),
+        el.textContent,
+        el.innerText,
+        el.dataset && el.dataset.answer,
+        el.dataset && el.dataset.choice,
+    ];
+    for (const candidate of candidates) {
+        const normalized = normalizeChoice(candidate);
+        if (normalized) return normalized;
+    }
+    return null;
+};
+
+const getPageCorrectAnswer = () => {
+    const selectors = [
+        '.correctAnswer', '.correct-answer', '.correctAnswerBlock', '.answer-key',
+        '[class*="correct"]', '[id*="correct"]', '[data-correct="true"]',
+        '.timerResult', '.result', '.answer-correct', '[aria-label*="correct"]'
+    ];
+    const values = [];
+    for (const selector of selectors) {
+        for (const el of document.querySelectorAll(selector)) {
+            const norm = normalizeChoice(
+                el.getAttribute('data-answer') ||
+                el.getAttribute('data-choice') ||
+                el.textContent ||
+                el.innerText
+            );
+            if (norm) values.push(norm);
+        }
+    }
+    return values.find(Boolean) || null;
+};
+
+const isAnswerLike = (el) => {
+    if (!el || !el.closest) return false;
+    const choice = normalizeChoice(extractChoiceFromElement(el));
+    if (choice && /^[A-E]$/.test(choice)) return true;
+    const directText = (((el.textContent || '').trim()) || '').toUpperCase();
+    if (!/^[A-E]$/.test(directText) && !/^[1-5]$/.test(directText)) return false;
+    return true;
+};
+
+const target = document.querySelector('#timer_abcde, .timer_abcde, .question-answers, .answer-options, .answers, .option-list, .choice-list');
 if (target && !window.__gmat_sim_observer) {
+    const persistChoice = (el) => {
+        if (!el || window.__gmat_question_key !== currentQuestionKey()) return;
+        const chosen = normalizeChoice(extractChoiceFromElement(el));
+        if (!chosen || !/^[A-E]$/.test(chosen)) return;
+        window.__gmat_user_choice = chosen;
+        window.__gmat_result = {
+            correct_choice: null,
+            selected_choice: chosen,
+            was_correct: null,
+        };
+    };
+
+    target.addEventListener('pointerdown', (event) => {
+        const el = event.target.closest('button, li, label, span');
+        if (isAnswerLike(el)) persistChoice(el);
+    }, true);
+
+    target.addEventListener('click', (event) => {
+        const el = event.target.closest('button, li, label, span');
+        if (isAnswerLike(el)) persistChoice(el);
+    }, true);
+
     const observer = new MutationObserver(() => {
-        const correctEl = target.querySelector('.correctAnswer');
-        const selectedEl = target.querySelector('.selectedAnswer');
-        if (correctEl && selectedEl) {
+        if (window.__gmat_question_key !== currentQuestionKey()) {
+            setCurrentQuestionContext();
+            return;
+        }
+
+        const allChoices = [...target.querySelectorAll('button, li, label, span')].filter(isAnswerLike);
+        let selected = null;
+        let correct = null;
+
+        for (const el of allChoices) {
+            const klass = (el.className || '').toString();
+            const text = (el.textContent || '').trim();
+            const isSelected = /selected|active|checked|clicked/i.test(klass) || el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-selected') === 'true';
+            const isCorrect = /correct/i.test(klass) && !/wrong/i.test(klass);
+            const isMaybeCorrectLabel = /correct answer|answer is/i.test(text.toLowerCase());
+
+            if (isSelected && !selected) selected = extractChoiceFromElement(el) || normalizeChoice(text);
+            if ((isCorrect || isMaybeCorrectLabel) && !correct) correct = extractChoiceFromElement(el) || normalizeChoice(text);
+        }
+
+        const chosen = selected || window.__gmat_user_choice;
+        const right = correct || getPageCorrectAnswer();
+
+        if (chosen && right) {
             window.__gmat_result = {
-                correct_choice: correctEl.textContent.trim(),
-                selected_choice: selectedEl.textContent.trim(),
-                was_correct: correctEl === selectedEl || correctEl.isEqualNode(selectedEl),
+                correct_choice: right,
+                selected_choice: chosen,
+                was_correct: chosen === right,
+            };
+        } else if (chosen && !right && window.__gmat_user_choice) {
+            window.__gmat_result = {
+                correct_choice: null,
+                selected_choice: chosen,
+                was_correct: null,
             };
         }
     });
-    observer.observe(target, { childList: true, subtree: true, attributes: true });
+
+    observer.observe(target, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'id', 'data-answer', 'data-choice', 'value', 'aria-pressed', 'aria-selected'] });
     window.__gmat_sim_observer = observer;
 }
 """
 
 
+
 def install_submission_interceptor(driver: Any) -> None:
     """Monkey-patch timer_answer() and attach a MutationObserver to capture correctness."""
     driver.execute_script(_INSTALL_SUBMISSION_INTERCEPTOR_JS)
+
+
+def set_question_context(driver: Any, question_url: str) -> None:
+    """Reset browser-side answer state for a newly loaded GMAT Club question URL."""
+    driver.execute_script(
+        """
+        window.__gmat_question_key = arguments[0] || window.location.href;
+        window.__gmat_user_choice = null;
+        window.__gmat_result = null;
+        window.__gmat_question_started_at = Date.now();
+        """,
+        question_url,
+    )
 
 
 def read_submission_result(driver: Any) -> Optional[Dict[str, Any]]:

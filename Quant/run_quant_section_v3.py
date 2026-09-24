@@ -12,11 +12,21 @@ master CSV append.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from selenium.common.exceptions import NoSuchWindowException
+
+try:
+    import certifi
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+except Exception:
+    pass
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -33,6 +43,7 @@ from engine.dom_scraper import (  # noqa: E402
     read_dom_timer_seconds,
     read_submission_result,
     scrape_question_stats,
+    set_question_context,
 )
 from engine.hud_overlay import inject_hud, read_review_list  # noqa: E402
 from engine.exclusion import (  # noqa: E402
@@ -91,20 +102,42 @@ def launch_driver():
             "undetected_chromedriver is not installed. Run: pip install undetected-chromedriver selenium"
         )
     CHROME_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    chrome_app = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
     options = uc.ChromeOptions()
     options.add_argument(f"--user-data-dir={CHROME_PROFILE_DIR}")
+    if Path(chrome_app).exists():
+        options.binary_location = chrome_app
     return uc.Chrome(options=options)
 
 
-def ensure_logged_in(driver) -> None:
+def is_gmatclub_error_page(driver) -> bool:
+    """Return True when GMAT Club is currently returning an outage/HTTP 500 page."""
+    try:
+        return bool(driver.execute_script("""
+            const text = (document.body && document.body.innerText) || '';
+            return /(This page isn't working|HTTP ERROR 500|currently unable to handle this request|Please try again later)/i.test(text);
+        """))
+    except Exception:
+        return False
+
+
+def ensure_logged_in(driver) -> bool:
     """Navigate to GMAT Club and prompt the user to log in if no session cookie is detected."""
     driver.get("https://gmatclub.com/forum/")
+    if is_gmatclub_error_page(driver):
+        print("GMAT Club is currently unavailable (HTTP 500 / outage page). Please retry later.")
+        return False
+
     is_logged_in = driver.execute_script(
         "return !!document.querySelector('.username, #username_logged_in, a[href*=\"logout\"]');"
     )
     if not is_logged_in:
         print("You don't appear to be logged into GMAT Club.")
         input("Please log in in the opened browser window, then press Enter to continue...")
+        if is_gmatclub_error_page(driver):
+            print("GMAT Club is still unavailable after login attempt. Stopping cleanly.")
+            return False
+    return True
 
 
 # ===========================================================================
@@ -233,15 +266,42 @@ def load_question_bank() -> List[dict]:
 
 
 def wait_for_answer(driver) -> Optional[dict]:
-    """Poll window.__gmat_result until the submission interceptor captures a response."""
+    """Use a tool-managed per-question timer and capture the page selection without clicking the site's timer."""
+    deadline = time.monotonic() + ANSWER_WAIT_TIMEOUT_SECONDS
+    print(f"Question timer started: {ANSWER_WAIT_TIMEOUT_SECONDS}s")
     elapsed = 0.0
-    while elapsed < ANSWER_WAIT_TIMEOUT_SECONDS:
+
+    while time.monotonic() < deadline:
         result = read_submission_result(driver)
         if result is not None:
             return result
+
+        try:
+            selected = driver.execute_script("return window.__gmat_user_choice || null;")
+        except Exception:
+            selected = None
+
+        if selected is not None:
+            selected_text = str(selected).strip().upper()
+            if selected_text in {'A', 'B', 'C', 'D', 'E'}:
+                remaining = max(0, int(deadline - time.monotonic()))
+                print(f"Detected selected option: {selected_text} ({remaining}s remaining)")
+                return {"was_correct": None, "selected_choice": selected_text, "correct_choice": None}
+            if selected_text in {'1', '2', '3', '4', '5'}:
+                mapped = ['A', 'B', 'C', 'D', 'E'][int(selected_text) - 1]
+                remaining = max(0, int(deadline - time.monotonic()))
+                print(f"Detected selected option: {mapped} ({remaining}s remaining)")
+                return {"was_correct": None, "selected_choice": mapped, "correct_choice": None}
+
+        if elapsed % 10 < ANSWER_WAIT_POLL_SECONDS:
+            remaining = max(0, int(deadline - time.monotonic()))
+            print(f"Waiting for answer... {remaining}s remaining")
+
         time.sleep(ANSWER_WAIT_POLL_SECONDS)
         elapsed += ANSWER_WAIT_POLL_SECONDS
-    return None
+
+    print("Question timer expired before the answer was captured.")
+    return {"was_correct": None, "selected_choice": None, "correct_choice": None}
 
 
 def prompt_manual_correctness() -> bool:
@@ -277,6 +337,8 @@ def run_question_loop(
             break
 
         driver.get(question["url"])
+        set_question_context(driver, question["url"])
+        question_started_at = time.monotonic()
         inject_feedback_mask(driver)
         inject_hud(
             driver,
@@ -286,18 +348,36 @@ def run_question_loop(
             question_id=question["id"],
         )
         install_submission_interceptor(driver)
-        auto_start_timer(driver)
+        # GMAT Club's timer start mutates the live question session and can advance
+        # to the next question before the user has selected an answer. Use the tool's
+        # own timer instead of clicking the page timer.
+        print("Using the tool timer; GMAT Club timer start is intentionally skipped to keep the current question open.")
 
         result = wait_for_answer(driver)
         stats = scrape_question_stats(driver)
         dom_elapsed = read_dom_timer_seconds(driver)
 
         if result is not None:
-            was_correct = bool(result.get("was_correct"))
+            selected = result.get("selected_choice")
+            correct = result.get("correct_choice")
+            if selected:
+                print(f"Captured selected answer: {selected}")
+            if correct:
+                print(f"Forum correct answer for this question: {correct}")
+            if result.get("was_correct") is not None:
+                was_correct = bool(result.get("was_correct"))
+                print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
+                if selected and correct:
+                    print(f"Selected {selected} vs correct {correct} -> {'MATCH' if selected == correct else 'MISMATCH'}")
+            else:
+                was_correct = prompt_manual_correctness()
+                print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
         else:
             was_correct = prompt_manual_correctness()
+            print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
 
-        question_elapsed = dom_elapsed if dom_elapsed else ANSWER_WAIT_POLL_SECONDS
+        wall_elapsed = time.monotonic() - question_started_at
+        question_elapsed = dom_elapsed if dom_elapsed and dom_elapsed > 0 else max(wall_elapsed, ANSWER_WAIT_POLL_SECONDS)
         elapsed_thinking_seconds += question_elapsed
 
         scorer.record_response(question, was_correct)
@@ -487,26 +567,31 @@ def main() -> None:
 
     driver = launch_driver()
     try:
-        ensure_logged_in(driver)
+        try:
+            if not ensure_logged_in(driver):
+                print("Aborting section because GMAT Club is unavailable.")
+                return
 
-        elapsed_thinking_seconds = run_question_loop(
-            driver, scorer, bank, ledger, session_id, served_ids,
-            elapsed_thinking_seconds, diagnostics_log,
-        )
-
-        run_review_phase(driver, diagnostics_log)
-
-        final_result = finalize_and_report(scorer, session_id, diagnostics_log, elapsed_thinking_seconds)
-
-        print("\n=== Final Score ===")
-        print(f"Scaled Score: {final_result['scaled_score']}")
-        print(f"Section Percentile: {final_result['section_percentile_for_scale']:.1f}")
-        if final_result["early_easy_medium_miss"]:
-            print("Note: An early easy/medium miss capped your maximum possible score.")
-
-        clear_active_session()
+            elapsed_thinking_seconds = run_question_loop(
+                driver, scorer, bank, ledger, session_id, served_ids,
+                elapsed_thinking_seconds, diagnostics_log,
+            )
+            run_review_phase(driver, diagnostics_log)
+            final_result = finalize_and_report(scorer, session_id, diagnostics_log, elapsed_thinking_seconds)
+            print("\n=== Final Score ===")
+            print(f"Scaled Score: {final_result['scaled_score']}")
+            print(f"Section Percentile: {final_result['section_percentile_for_scale']:.1f}")
+            if final_result["early_easy_medium_miss"]:
+                print("Note: An early easy/medium miss capped your maximum possible score.")
+            clear_active_session()
+        except NoSuchWindowException:
+            print("Chrome window was closed. Please keep the browser open while the session runs. Exiting cleanly.")
+            return
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

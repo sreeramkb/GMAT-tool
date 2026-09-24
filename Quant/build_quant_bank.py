@@ -99,10 +99,10 @@ NON_QUESTION_URL_PATTERNS = re.compile(
 # ---------------------------------------------------------------------------
 
 def detect_column(fieldnames: list[str], hints: tuple[str, ...]) -> Optional[str]:
-    lower_map = {name: name.lower() for name in fieldnames}
-    for name, lower in lower_map.items():
-        if any(hint in lower for hint in hints):
-            return name
+    for hint in hints:
+        for name in fieldnames:
+            if hint in name.lower():
+                return name
     return None
 
 
@@ -124,17 +124,26 @@ def detect_columns(fieldnames: list[str]) -> tuple[str, str]:
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def parse_difficulty(tag_text: str) -> Optional[int]:
-    for pattern, band_index in DIFFICULTY_TAG_PATTERNS:
-        if pattern.search(tag_text):
-            return band_index
+def _cell_texts(value: str | dict[str, str]) -> list[str]:
+    if isinstance(value, dict):
+        return [str(v or "").strip() for v in value.values() if str(v or "").strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def parse_difficulty(tag_text: str | dict[str, str]) -> Optional[int]:
+    for text in _cell_texts(tag_text):
+        for pattern, band_index in DIFFICULTY_TAG_PATTERNS:
+            if pattern.search(text):
+                return band_index
     return None
 
 
-def classify_category(tag_text: str) -> tuple[str, str]:
-    for pattern, category, subtopic in CATEGORY_RULES:
-        if pattern.search(tag_text):
-            return category, subtopic
+def classify_category(tag_text: str | dict[str, str]) -> tuple[str, str]:
+    for text in _cell_texts(tag_text):
+        for pattern, category, subtopic in CATEGORY_RULES:
+            if pattern.search(text):
+                return category, subtopic
     return DEFAULT_CATEGORY, DEFAULT_SUBTOPIC
 
 
@@ -187,7 +196,7 @@ def build_bank(input_csv: Path, out_json: Path, out_csv: Path) -> None:
 
     for row in rows:
         raw_url = (row.get(url_col) or "").strip()
-        tag_text = (row.get(tag_col) or "").strip()
+        tag_text = row
 
         if not is_question_row(raw_url):
             skipped_non_question += 1
