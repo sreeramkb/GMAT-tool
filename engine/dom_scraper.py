@@ -93,7 +93,7 @@ const result = {
 };
 
 document.querySelectorAll('.statisticWrap, .statisticWrapExisting').forEach(wrap => {
-    const label = (wrap.querySelector('.answerLabel, .choiceLabel') || {}).textContent;
+    const label = (wrap.querySelector('.answerType, .answerLabel, .choiceLabel') || {}).textContent;
     const value = pct.call(null, null) || null;
     const pctEl = wrap.querySelector('.answerPercentage');
     if (label && pctEl) {
@@ -195,6 +195,11 @@ const normalizeChoice = (value) => {
     const singleNumber = upper.match(/^([1-5])$/);
     if (singleNumber) return ['A', 'B', 'C', 'D', 'E'][Number(singleNumber[1]) - 1];
 
+    // GMAT Club's real timer_answer(choiceCode) uses an offset-by-10 numeric
+    // code (11-15) rather than a plain 1-5 index or letter.
+    const offsetNumber = upper.match(/^1([1-5])$/);
+    if (offsetNumber) return ['A', 'B', 'C', 'D', 'E'][Number(offsetNumber[1]) - 1];
+
     const flat = upper.replace(/[^0-9]/g, '');
     if (/^[1-5]$/.test(flat)) return ['A', 'B', 'C', 'D', 'E'][Number(flat) - 1];
 
@@ -203,6 +208,13 @@ const normalizeChoice = (value) => {
 
 const extractChoiceFromElement = (el) => {
     if (!el) return null;
+    // A dedicated label sub-element (if present) is the least ambiguous source -
+    // prefer it before falling back to the element's own (possibly noisy) text.
+    const labelEl = el.querySelector && el.querySelector('.answerType, .answerLabel, .choiceLabel, [class*="answerLabel" i], [class*="choiceLabel" i]');
+    if (labelEl) {
+        const fromLabel = normalizeChoice(labelEl.textContent);
+        if (fromLabel) return fromLabel;
+    }
     const candidates = [
         el.getAttribute('data-answer'),
         el.getAttribute('data-choice'),
@@ -219,14 +231,23 @@ const extractChoiceFromElement = (el) => {
         const normalized = normalizeChoice(candidate);
         if (normalized) return normalized;
     }
+    // Last resort: text like "A." / "A)" / "A Correct" where a letter prefix is
+    // followed by other markup/labels (e.g. a checkmark icon's text) that would
+    // otherwise fail a strict exact-match normalize.
+    const text = ((el.textContent || el.innerText || '') + '').trim();
+    const leadingMatch = text.match(/^([A-E])(?=[.\):\s]|$)/i);
+    if (leadingMatch) return leadingMatch[1].toUpperCase();
     return null;
 };
 
 const getPageCorrectAnswer = () => {
+    // Ordered from most-specific (least likely to false-positive) to broadest,
+    // since the first normalize-able match wins.
     const selectors = [
         '.correctAnswer', '.correct-answer', '.correctAnswerBlock', '.answer-key',
-        '[class*="correct"]', '[id*="correct"]', '[data-correct="true"]',
-        '.timerResult', '.result', '.answer-correct', '[aria-label*="correct"]'
+        '[data-correct="true"]',
+        '.timerResult', '.result', '.answer-correct', '[aria-label*="correct"]',
+        '[class*="correct"]', '[id*="correct"]'
     ];
     const values = [];
     for (const selector of selectors) {
@@ -243,14 +264,28 @@ const getPageCorrectAnswer = () => {
     return values.find(Boolean) || null;
 };
 
-const isAnswerLike = (el) => {
-    if (!el || !el.closest) return false;
-    const choice = normalizeChoice(extractChoiceFromElement(el));
-    if (choice && /^[A-E]$/.test(choice)) return true;
-    const directText = (((el.textContent || '').trim()) || '').toUpperCase();
-    if (!/^[A-E]$/.test(directText) && !/^[1-5]$/.test(directText)) return false;
-    return true;
+// GMAT Club replaces the answer buttons with a per-choice stats display once
+// submitted: each choice becomes a ".statisticWrap" wrapper containing a
+// ".answerType" letter (a-e). The WRAPPER itself gets "correctAnswer" and/or
+// "selectedAnswer" classes added - but every child ".answerPercentage" span
+// always carries a "correctAnswer" class too (it's just a bar-color styling
+// class, unrelated to which choice is actually correct), so correctness must
+// be read from the wrapper's own classList, never a descendant's.
+const getRevealedVerdict = () => {
+    let correct = null;
+    let selected = null;
+    for (const wrap of document.querySelectorAll('.statisticWrap, .statisticWrapExisting')) {
+        const typeEl = wrap.querySelector('.answerType');
+        if (!typeEl) continue;
+        const letter = normalizeChoice(typeEl.textContent);
+        if (!letter) continue;
+        if (wrap.classList.contains('correctAnswer')) correct = letter;
+        if (wrap.classList.contains('selectedAnswer')) selected = letter;
+    }
+    return { correct, selected };
 };
+
+const isAnswerLike = (el) => !!(el && el.closest && extractChoiceFromElement(el));
 
 const target = document.querySelector('#timer_abcde, .timer_abcde, .question-answers, .answer-options, .answers, .option-list, .choice-list');
 if (target && !window.__gmat_sim_observer) {
@@ -267,12 +302,12 @@ if (target && !window.__gmat_sim_observer) {
     };
 
     target.addEventListener('pointerdown', (event) => {
-        const el = event.target.closest('button, li, label, span');
+        const el = event.target.closest('button, li, label, span, div');
         if (isAnswerLike(el)) persistChoice(el);
     }, true);
 
     target.addEventListener('click', (event) => {
-        const el = event.target.closest('button, li, label, span');
+        const el = event.target.closest('button, li, label, span, div');
         if (isAnswerLike(el)) persistChoice(el);
     }, true);
 
@@ -282,31 +317,23 @@ if (target && !window.__gmat_sim_observer) {
             return;
         }
 
-        const allChoices = [...target.querySelectorAll('button, li, label, span')].filter(isAnswerLike);
-        let selected = null;
-        let correct = null;
+        // The click handler above already captured exactly which option the user
+        // pressed. Trust that capture for "chosen" - the revealed ".selectedAnswer"
+        // wrapper is a secondary confirmation, not the primary source, since a
+        // future markup change there shouldn't silently break selection tracking.
+        const chosen = window.__gmat_user_choice;
+        if (!chosen) return;
 
-        for (const el of allChoices) {
-            const klass = (el.className || '').toString();
-            const text = (el.textContent || '').trim();
-            const isSelected = /selected|active|checked|clicked/i.test(klass) || el.getAttribute('aria-pressed') === 'true' || el.getAttribute('aria-selected') === 'true';
-            const isCorrect = /correct/i.test(klass) && !/wrong/i.test(klass);
-            const isMaybeCorrectLabel = /correct answer|answer is/i.test(text.toLowerCase());
-
-            if (isSelected && !selected) selected = extractChoiceFromElement(el) || normalizeChoice(text);
-            if ((isCorrect || isMaybeCorrectLabel) && !correct) correct = extractChoiceFromElement(el) || normalizeChoice(text);
-        }
-
-        const chosen = selected || window.__gmat_user_choice;
+        const { correct } = getRevealedVerdict();
         const right = correct || getPageCorrectAnswer();
 
-        if (chosen && right) {
+        if (right) {
             window.__gmat_result = {
                 correct_choice: right,
                 selected_choice: chosen,
                 was_correct: chosen === right,
             };
-        } else if (chosen && !right && window.__gmat_user_choice) {
+        } else {
             window.__gmat_result = {
                 correct_choice: null,
                 selected_choice: chosen,
@@ -343,3 +370,62 @@ def set_question_context(driver: Any, question_url: str) -> None:
 def read_submission_result(driver: Any) -> Optional[Dict[str, Any]]:
     """Read window.__gmat_result populated by the submission interceptor, if available."""
     return driver.execute_script("return window.__gmat_result || null;")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics — dump the real answer-area markup so brittle selectors above
+# can be corrected against GMAT Club's actual DOM instead of guessed again.
+# ---------------------------------------------------------------------------
+
+_DUMP_ANSWER_AREA_JS = """
+const candidates = [
+    '#timer_abcde', '.timer_abcde', '.question-answers', '.answer-options',
+    '.answers', '.option-list', '.choice-list'
+];
+let target = null;
+let matchedSelector = null;
+for (const sel of candidates) {
+    const el = document.querySelector(sel);
+    if (el) { target = el; matchedSelector = sel; break; }
+}
+
+// None of the guessed selectors matched GMAT Club's real markup - fall back to
+// a heuristic: find leaf elements whose text is exactly one of A-E and see if
+// several of them share a common ancestor (that ancestor is likely the answer list).
+let letterElementCount = 0;
+if (!target) {
+    const letterEls = [...document.querySelectorAll('button, li, label, span, div')].filter(el => {
+        if (el.children.length > 0) return false;
+        return /^[A-E]$/.test((el.textContent || '').trim());
+    });
+    letterElementCount = letterEls.length;
+    const parentCounts = new Map();
+    for (const el of letterEls) {
+        const p = el.parentElement && el.parentElement.parentElement;
+        if (!p) continue;
+        parentCounts.set(p, (parentCounts.get(p) || 0) + 1);
+    }
+    let bestParent = null, bestCount = 0;
+    for (const [p, c] of parentCounts.entries()) {
+        if (c > bestCount) { bestCount = c; bestParent = p; }
+    }
+    if (bestParent && bestCount >= 3) {
+        target = bestParent;
+        matchedSelector = '(heuristic: common ancestor of single-letter elements)';
+    }
+}
+
+const html = target ? target.outerHTML : null;
+return {
+    matched_selector: matchedSelector,
+    target_html: html ? html.slice(0, 20000) : null,
+    letter_element_count: letterElementCount,
+    timer_answer_source: (typeof window.timer_answer === 'function') ? window.timer_answer.toString() : null,
+    body_html_length: document.body ? document.body.innerHTML.length : 0,
+};
+"""
+
+
+def dump_answer_area_diagnostics(driver: Any) -> Dict[str, Any]:
+    """Capture the real answer-choices markup + timer_answer() source for debugging selectors."""
+    return driver.execute_script(f"return (function() {{ {_DUMP_ANSWER_AREA_JS} }})();")

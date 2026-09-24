@@ -1,25 +1,36 @@
 """
-Quant/run_quant_section_v3.py — Main test runner for the GMAT Focus Quant section.
+DI_Adaptive/run_di_section.py — Main test runner for the GMAT Focus Data
+Insights section.
 
-Launches undetected_chromedriver with a persistent profile, resumes an
-in-progress session if one exists, then runs the adaptive question loop:
-select -> navigate -> mask feedback -> inject HUD -> intercept submission
--> auto-start timer -> wait for answer -> scrape DOM -> update both engine
-tracks -> save state. Finishes with the review phase, final scoring, and a
-master CSV append.
+Mirrors Quant/run_quant_section_v3.py's browser automation (same
+undetected_chromedriver setup, same fixed dom_scraper click/correctness
+detection), with DI-specific differences per architecture §3 and §11:
+
+  - Blueprint is randomized per session: Standard (75%) or Extended MSR (25%).
+  - The "Graphs and Tables" category has Graphics Interpretation / Table
+    Analysis sub-quotas tracked independently of the engine's category state.
+  - MSRs are a single GMAT Club page containing multiple (default 3)
+    sub-question answer areas; each sub-answer is collected in sequence and
+    scored via BandedScorerV3.record_msr_response().
+
+NOTE: the MSR sub-question flow is a first attempt built without a live GMAT
+Club MSR page to verify against (per the Quant lesson: selectors that look
+reasonable often don't match the real site). Run with GMAT_SIM_DUMP_DOM=1 set
+and correct the DOM assumptions the same way §13.3 was fixed for Quant.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from selenium.common.exceptions import NoSuchWindowException
 
@@ -39,7 +50,6 @@ from engine.banded_scorer_v3 import (  # noqa: E402
     new_section_state,
 )
 from engine.dom_scraper import (  # noqa: E402
-    auto_start_timer,
     dump_answer_area_diagnostics,
     inject_feedback_mask,
     install_submission_interceptor,
@@ -64,27 +74,43 @@ except ImportError:  # pragma: no cover - allows the module to be imported witho
 
 
 # ===========================================================================
-# Constants (architecture §3 — Quant blueprint, §14 — timer budget)
+# Constants (architecture §3 — DI blueprint, §14 — timer budget)
 # ===========================================================================
 
-SECTION_NAME = "Quant"
-TOTAL_QUESTIONS = 21
+SECTION_NAME = "DI"
+TOTAL_QUESTIONS = 20
 TIME_BUDGET_SECONDS = 2700  # 45 minutes of thinking time
 
-CATEGORY_QUOTAS = {
-    "Counting/Sets/Series/Prob/Stats": 5,
-    "Rates/Ratio/Percent": 5,
-    "Equal/Unequal/ALG": 6,
-    "Value/Order/Factors": 5,
+GRAPHS_AND_TABLES_CATEGORY = "Graphs and Tables"
+MSR_CATEGORY = "MSRs"
+
+# architecture §3 — Standard Blueprint (75% chance)
+STANDARD_CATEGORY_QUOTAS = {
+    "Data Sufficiency": 7,
+    GRAPHS_AND_TABLES_CATEGORY: 6,
+    MSR_CATEGORY: 3,
+    "Two-Part Analysis": 4,
 }
+STANDARD_SUBTOPIC_QUOTAS = {"Graphics Interpretation": 3, "Table Analysis": 3}
+
+# architecture §3 — Extended MSR Blueprint (25% chance)
+EXTENDED_CATEGORY_QUOTAS = {
+    "Data Sufficiency": 6,
+    GRAPHS_AND_TABLES_CATEGORY: 5,
+    MSR_CATEGORY: 6,
+    "Two-Part Analysis": 3,
+}
+EXTENDED_SUBTOPIC_QUOTAS = {"Graphics Interpretation": 3, "Table Analysis": 2}
+
+STANDARD_BLUEPRINT_WEIGHT = 0.75
 
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 
-QUESTION_BANK_PATH = BASE_DIR / "questions_quant_v1.json"
+QUESTION_BANK_PATH = BASE_DIR / "questions_di_v1.json"
 USED_QUESTIONS_LEDGER_PATH = BASE_DIR / "used_questions.json"
 ACTIVE_SESSION_PATH = BASE_DIR / "active_session.json"
-REPORTS_DIR = BASE_DIR / "quant_reports"
+REPORTS_DIR = BASE_DIR / "di_reports"
 MASTER_CSV_PATH = ROOT_DIR / "score_report_master_v2.csv"
 CHROME_PROFILE_DIR = ROOT_DIR / ".gmatclub_uc_profile"
 
@@ -96,7 +122,7 @@ MAX_REVIEW_EDITS = 3
 
 
 # ===========================================================================
-# Browser setup
+# Browser setup (identical approach to the Quant runner)
 # ===========================================================================
 
 def launch_driver():
@@ -287,14 +313,18 @@ def prompt_resume() -> bool:
     return answer in ("", "y", "yes")
 
 
-def prompt_start_params() -> tuple[float, int]:
+def prompt_start_params() -> float:
     percentile_raw = input("Starting percentile (default 60): ").strip()
-    starting_percentile = float(percentile_raw) if percentile_raw else 60.0
+    return float(percentile_raw) if percentile_raw else 60.0
 
-    count_raw = input(f"Number of questions (default {TOTAL_QUESTIONS}): ").strip()
-    question_count = int(count_raw) if count_raw else TOTAL_QUESTIONS
 
-    return starting_percentile, question_count
+def choose_blueprint() -> Tuple[Dict[str, int], Dict[str, int]]:
+    """Randomize the DI blueprint per architecture §3: Standard (75%) or Extended MSR (25%)."""
+    if random.random() < STANDARD_BLUEPRINT_WEIGHT:
+        print("Blueprint: Standard (DS 7 / Graphs & Tables 6 / MSRs 3 / Two-Part 4)")
+        return dict(STANDARD_CATEGORY_QUOTAS), dict(STANDARD_SUBTOPIC_QUOTAS)
+    print("Blueprint: Extended MSR (DS 6 / Graphs & Tables 5 / MSRs 6 / Two-Part 3)")
+    return dict(EXTENDED_CATEGORY_QUOTAS), dict(EXTENDED_SUBTOPIC_QUOTAS)
 
 
 # ===========================================================================
@@ -303,11 +333,28 @@ def prompt_start_params() -> tuple[float, int]:
 
 def load_question_bank() -> List[dict]:
     if not QUESTION_BANK_PATH.exists():
-        raise FileNotFoundError(f"Question bank not found: {QUESTION_BANK_PATH}")
+        raise FileNotFoundError(
+            f"Question bank not found: {QUESTION_BANK_PATH}\n"
+            f"Run build_di_bank.py against a GMAT Club Data Insights CSV export first."
+        )
     return json.loads(QUESTION_BANK_PATH.read_text(encoding="utf-8"))
 
 
-def wait_for_answer(driver) -> Optional[dict]:
+def filter_by_subtopic_quota(
+    bank: List[dict], subtopic_answered: Dict[str, int], subtopic_quotas: Dict[str, int]
+) -> List[dict]:
+    """Exclude Graphs and Tables candidates whose Graphics/Table sub-quota is already met."""
+    result = []
+    for q in bank:
+        if q.get("category") == GRAPHS_AND_TABLES_CATEGORY:
+            subtopic = q.get("subtopic")
+            if subtopic in subtopic_quotas and subtopic_answered.get(subtopic, 0) >= subtopic_quotas[subtopic]:
+                continue
+        result.append(q)
+    return result
+
+
+def wait_for_answer(driver, dump_tag: str = "") -> Optional[dict]:
     """Use a tool-managed per-question timer and capture the page selection without clicking the site's timer."""
     deadline = time.monotonic() + ANSWER_WAIT_TIMEOUT_SECONDS
     print(f"Question timer started: {ANSWER_WAIT_TIMEOUT_SECONDS}s")
@@ -326,8 +373,7 @@ def wait_for_answer(driver) -> Optional[dict]:
             # A click was captured but the page hasn't revealed correctness yet
             # (e.g. GMAT Club's AJAX response / class update hasn't landed). Keep
             # polling for a short settle window instead of trusting this
-            # placeholder immediately - returning it too early is what caused a
-            # correct click to be reported as wrong before the reveal happened.
+            # placeholder immediately.
             if not announced_selection:
                 selected_choice = result.get("selected_choice")
                 if selected_choice:
@@ -341,7 +387,7 @@ def wait_for_answer(driver) -> Optional[dict]:
                 elapsed += ANSWER_WAIT_POLL_SECONDS
                 continue
             if os.environ.get("GMAT_SIM_DUMP_DOM") == "1":
-                dump_path = BASE_DIR / "dom_debug_after_click.json"
+                dump_path = BASE_DIR / f"dom_debug_after_click{dump_tag}.json"
                 dump_path.write_text(
                     json.dumps(dump_answer_area_diagnostics(driver), indent=2),
                     encoding="utf-8",
@@ -366,6 +412,59 @@ def prompt_manual_correctness() -> bool:
     return answer.startswith("y")
 
 
+def resolve_single_answer(driver, dump_tag: str = "") -> bool:
+    """Wait for one answer submission and return whether it was correct."""
+    result = wait_for_answer(driver, dump_tag=dump_tag)
+    stats = None
+    if result is not None:
+        selected = result.get("selected_choice")
+        correct = result.get("correct_choice")
+        if selected:
+            print(f"Captured selected answer: {selected}")
+        if correct:
+            print(f"Forum correct answer for this question: {correct}")
+        if result.get("was_correct") is not None:
+            was_correct = bool(result.get("was_correct"))
+            print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
+            if selected and correct:
+                print(f"Selected {selected} vs correct {correct} -> {'MATCH' if selected == correct else 'MISMATCH'}")
+        else:
+            was_correct = prompt_manual_correctness()
+            print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
+    else:
+        was_correct = prompt_manual_correctness()
+        print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
+    return was_correct
+
+
+def run_msr_question(driver, question: dict) -> List[Tuple[int, bool]]:
+    """Collect answers for each MSR sub-question on the same page (architecture §11).
+
+    GMAT Club presents all MSR sub-questions as separate answer areas on one
+    page. Between sub-questions we reset the tool's tracked answer state so
+    each one is captured independently; the sub-question's own DOM update
+    (e.g. a tab switch) re-triggers install_submission_interceptor's
+    MutationObserver without a full page reload.
+    """
+    child_count = question.get("msr_child_count", 3)
+    child_difficulties = question.get("msr_child_difficulty_indices", [question["difficulty_index"]] * child_count)
+    children: List[Tuple[int, bool]] = []
+
+    for i in range(child_count):
+        print(f"\n--- MSR sub-question {i + 1}/{child_count} ---")
+        # Re-use the real page URL (not a synthetic per-child key) - the
+        # interceptor's guard compares against the live window.location.href,
+        # which doesn't change between MSR sub-question tabs on the same page.
+        set_question_context(driver, question["url"])
+        install_submission_interceptor(driver)
+        was_correct = resolve_single_answer(driver, dump_tag=f"_msr{i}")
+        children.append((child_difficulties[i], was_correct))
+        if i < child_count - 1:
+            input("Press Enter once the next MSR sub-question is visible...")
+
+    return children
+
+
 def run_question_loop(
     driver,
     scorer: BandedScorerV3,
@@ -375,6 +474,8 @@ def run_question_loop(
     served_ids: set,
     elapsed_thinking_seconds: float,
     diagnostics_log: List[dict],
+    subtopic_quotas: Dict[str, int],
+    subtopic_answered: Dict[str, int],
 ) -> float:
     section = scorer.section
 
@@ -386,6 +487,7 @@ def run_question_loop(
 
         excluded_ids = build_exclusion_set(ledger, served_ids)
         available = filter_available_questions(bank, excluded_ids)
+        available = filter_by_subtopic_quota(available, subtopic_answered, subtopic_quotas)
 
         question = scorer.select_question(available)
         if question is None:
@@ -404,9 +506,6 @@ def run_question_loop(
             question_id=question["id"],
         )
         install_submission_interceptor(driver)
-        # GMAT Club's timer start mutates the live question session and can advance
-        # to the next question before the user has selected an answer. Use the tool's
-        # own timer instead of clicking the page timer.
         print("Using the tool timer; GMAT Club timer start is intentionally skipped to keep the current question open.")
 
         if os.environ.get("GMAT_SIM_DUMP_DOM") == "1":
@@ -417,34 +516,23 @@ def run_question_loop(
             )
             print(f"Dumped answer-area diagnostics to {dump_path}")
 
-        result = wait_for_answer(driver)
+        if question["delivery_type"] == "MSR":
+            children = run_msr_question(driver, question)
+            was_correct = all(correct for _, correct in children)
+            scorer.record_msr_response(question["category"], children)
+        else:
+            was_correct = resolve_single_answer(driver)
+            scorer.record_response(question, was_correct)
+
         stats = scrape_question_stats(driver)
         dom_elapsed = read_dom_timer_seconds(driver)
-
-        if result is not None:
-            selected = result.get("selected_choice")
-            correct = result.get("correct_choice")
-            if selected:
-                print(f"Captured selected answer: {selected}")
-            if correct:
-                print(f"Forum correct answer for this question: {correct}")
-            if result.get("was_correct") is not None:
-                was_correct = bool(result.get("was_correct"))
-                print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
-                if selected and correct:
-                    print(f"Selected {selected} vs correct {correct} -> {'MATCH' if selected == correct else 'MISMATCH'}")
-            else:
-                was_correct = prompt_manual_correctness()
-                print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
-        else:
-            was_correct = prompt_manual_correctness()
-            print(f"Answer verdict: {'CORRECT' if was_correct else 'WRONG'}")
 
         wall_elapsed = time.monotonic() - question_started_at
         question_elapsed = dom_elapsed if dom_elapsed and dom_elapsed > 0 else max(wall_elapsed, ANSWER_WAIT_POLL_SECONDS)
         elapsed_thinking_seconds += question_elapsed
 
-        scorer.record_response(question, was_correct)
+        if question["category"] == GRAPHS_AND_TABLES_CATEGORY:
+            subtopic_answered[question["subtopic"]] = subtopic_answered.get(question["subtopic"], 0) + 1
 
         served_ids.add(question["id"])
         ledger.record(question["id"], question["url"], session_id)
@@ -453,6 +541,8 @@ def run_question_loop(
             "question_id": question["id"],
             "url": question["url"],
             "category": question["category"],
+            "subtopic": question.get("subtopic"),
+            "delivery_type": question["delivery_type"],
             "difficulty_index": question["difficulty_index"],
             "was_correct": was_correct,
             "elapsed_seconds": question_elapsed,
@@ -467,6 +557,8 @@ def run_question_loop(
             "elapsed_thinking_seconds": elapsed_thinking_seconds,
             "diagnostics_log": diagnostics_log,
             "section_state": section_state_to_dict(section),
+            "subtopic_quotas": subtopic_quotas,
+            "subtopic_answered": subtopic_answered,
         })
 
         print(
@@ -490,10 +582,10 @@ def run_review_phase(driver, diagnostics_log: List[dict]) -> None:
     bookmarked = set(read_review_list(driver) or [])
 
     print("\n--- Review Phase ---")
-    print(f"{'#':<4}{'Category':<35}{'Band':<6}{'Bookmarked':<12}{'URL'}")
+    print(f"{'#':<4}{'Category':<25}{'Subtopic':<25}{'Band':<6}{'Bookmarked':<12}{'URL'}")
     for i, entry in enumerate(diagnostics_log, start=1):
         flag = "*" if entry["question_id"] in bookmarked else ""
-        print(f"{i:<4}{entry['category']:<35}{entry['difficulty_index']:<6}{flag:<12}{entry['url']}")
+        print(f"{i:<4}{entry['category']:<25}{(entry.get('subtopic') or ''):<25}{entry['difficulty_index']:<6}{flag:<12}{entry['url']}")
 
     edits_used = 0
     while edits_used < MAX_REVIEW_EDITS:
@@ -597,13 +689,15 @@ def finalize_and_report(
 # ===========================================================================
 
 def main() -> None:
-    print(f"=== GMAT Focus Quant Section (V3 Hybrid Engine) ===")
+    print("=== GMAT Focus Data Insights Section (V3 Hybrid Engine) ===")
 
     resumed_state = load_active_session()
     session_id: str
     served_ids: set
     diagnostics_log: List[dict]
     elapsed_thinking_seconds: float
+    subtopic_quotas: Dict[str, int]
+    subtopic_answered: Dict[str, int]
 
     if resumed_state and prompt_resume():
         session_id = resumed_state["session_id"]
@@ -611,17 +705,21 @@ def main() -> None:
         elapsed_thinking_seconds = resumed_state["elapsed_thinking_seconds"]
         diagnostics_log = resumed_state["diagnostics_log"]
         section = section_state_from_dict(resumed_state["section_state"])
+        subtopic_quotas = resumed_state.get("subtopic_quotas", dict(STANDARD_SUBTOPIC_QUOTAS))
+        subtopic_answered = resumed_state.get("subtopic_answered", {})
     else:
         clear_active_session()
         session_id = str(uuid.uuid4())
         served_ids = set()
         elapsed_thinking_seconds = 0.0
         diagnostics_log = []
-        starting_percentile, question_count = prompt_start_params()
+        subtopic_answered = {}
+        starting_percentile = prompt_start_params()
+        category_quotas, subtopic_quotas = choose_blueprint()
         section = new_section_state(
             section_name=SECTION_NAME,
-            category_quotas=CATEGORY_QUOTAS,
-            total_questions=question_count,
+            category_quotas=category_quotas,
+            total_questions=TOTAL_QUESTIONS,
             seed_overall_percentile=starting_percentile,
         )
 
@@ -639,6 +737,7 @@ def main() -> None:
             elapsed_thinking_seconds = run_question_loop(
                 driver, scorer, bank, ledger, session_id, served_ids,
                 elapsed_thinking_seconds, diagnostics_log,
+                subtopic_quotas, subtopic_answered,
             )
             run_review_phase(driver, diagnostics_log)
             final_result = finalize_and_report(scorer, session_id, diagnostics_log, elapsed_thinking_seconds)
