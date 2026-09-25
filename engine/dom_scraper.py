@@ -9,7 +9,7 @@ undetected_chromedriver without a hard import dependency.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # ---------------------------------------------------------------------------
 # §13.2 — CSS feedback masking
@@ -370,6 +370,50 @@ def set_question_context(driver: Any, question_url: str) -> None:
 def read_submission_result(driver: Any) -> Optional[Dict[str, Any]]:
     """Read window.__gmat_result populated by the submission interceptor, if available."""
     return driver.execute_script("return window.__gmat_result || null;")
+
+
+# ---------------------------------------------------------------------------
+# Text-banner verdict — GMAT Club's newer "Focus Edition" question formats
+# (Data Sufficiency, Two-Part Analysis, MSR, Graphs & Tables) use an explicit
+# "Submit Answer" button rather than an instant-click #timer_abcde widget, and
+# reveal correctness as a plain text banner ("Your answer is correct/incorrect")
+# instead of CSS classes. This is independent of the click interceptor above -
+# no monkey-patching needed, just poll for the banner text appearing.
+# ---------------------------------------------------------------------------
+
+_READ_TEXT_VERDICT_JS = """
+const text = (document.body && document.body.innerText) || '';
+if (/your answer is incorrect/i.test(text)) return { was_correct: false };
+if (/your answer is correct\\b/i.test(text)) return { was_correct: true };
+return null;
+"""
+
+
+def read_text_based_verdict(driver: Any) -> Optional[Dict[str, Any]]:
+    """Poll for GMAT Club's 'Your answer is correct/incorrect' text banner."""
+    return driver.execute_script(f"return (function() {{ {_READ_TEXT_VERDICT_JS} }})();")
+
+
+_READ_ALL_TEXT_VERDICTS_JS = """
+const text = (document.body && document.body.innerText) || '';
+const regex = /your answer is (correct|incorrect)\\b/gi;
+const results = [];
+let m;
+while ((m = regex.exec(text)) !== null) {
+    results.push({ was_correct: m[1].toLowerCase() === 'correct' });
+}
+return results;
+"""
+
+
+def read_all_text_verdicts(driver: Any) -> List[Dict[str, Any]]:
+    """Return every 'Your answer is correct/incorrect' banner currently on the
+    page, in document order. Used for MSR pages where multiple sub-question
+    verdicts can be visible at once - comparing the returned list's length
+    against a previously-seen count is what distinguishes a genuinely NEW
+    verdict from a stale one left over from an already-answered sub-question."""
+    return driver.execute_script(f"return (function() {{ {_READ_ALL_TEXT_VERDICTS_JS} }})();") or []
+
 
 
 # ---------------------------------------------------------------------------

@@ -53,8 +53,10 @@ from engine.dom_scraper import (  # noqa: E402
     dump_answer_area_diagnostics,
     inject_feedback_mask,
     install_submission_interceptor,
+    read_all_text_verdicts,
     read_dom_timer_seconds,
     read_submission_result,
+    read_text_based_verdict,
     scrape_question_stats,
     set_question_context,
 )
@@ -420,7 +422,7 @@ def filter_by_subtopic_quota(
     return result
 
 
-def wait_for_answer(driver, dump_tag: str = "") -> Optional[dict]:
+def wait_for_answer(driver, dump_tag: str = "", use_text_verdict: bool = False) -> Optional[dict]:
     """Use a tool-managed per-question timer and capture the page selection without clicking the site's timer."""
     deadline = time.monotonic() + ANSWER_WAIT_TIMEOUT_SECONDS
     print(f"Question timer started: {ANSWER_WAIT_TIMEOUT_SECONDS}s")
@@ -430,6 +432,18 @@ def wait_for_answer(driver, dump_tag: str = "") -> Optional[dict]:
     announced_selection = False
 
     while time.monotonic() < deadline:
+        if use_text_verdict:
+            # Two-Part Analysis uses GMAT Club's newer "Submit Answer" format,
+            # which reveals correctness as a plain text banner rather than via
+            # the click-driven #timer_abcde widget (DS/Quant still use that).
+            text_verdict = read_text_based_verdict(driver)
+            if text_verdict is not None:
+                return {
+                    "was_correct": text_verdict["was_correct"],
+                    "selected_choice": None,
+                    "correct_choice": None,
+                }
+
         result = read_submission_result(driver)
 
         if result is not None and result.get("was_correct") is not None:
@@ -478,9 +492,9 @@ def prompt_manual_correctness() -> bool:
     return answer.startswith("y")
 
 
-def resolve_single_answer(driver, dump_tag: str = "") -> bool:
+def resolve_single_answer(driver, dump_tag: str = "", use_text_verdict: bool = False) -> bool:
     """Wait for one answer submission and return whether it was correct."""
-    result = wait_for_answer(driver, dump_tag=dump_tag)
+    result = wait_for_answer(driver, dump_tag=dump_tag, use_text_verdict=use_text_verdict)
     stats = None
     if result is not None:
         selected = result.get("selected_choice")
@@ -503,30 +517,59 @@ def resolve_single_answer(driver, dump_tag: str = "") -> bool:
     return was_correct
 
 
+MSR_MAX_SUBQUESTIONS_SAFETY_CAP = 10  # sanity bound in case detection loops indefinitely
+MSR_IDLE_TIMEOUT_SECONDS = 90.0  # stop watching for more sub-questions after this much inactivity
+
+
 def run_msr_question(driver, question: dict) -> List[Tuple[int, bool]]:
     """Collect answers for each MSR sub-question on the same page (architecture §11).
 
     GMAT Club presents all MSR sub-questions as separate answer areas on one
-    page. Between sub-questions we reset the tool's tracked answer state so
-    each one is captured independently; the sub-question's own DOM update
-    (e.g. a tab switch) re-triggers install_submission_interceptor's
-    MutationObserver without a full page reload.
+    page, using the same "Submit Answer" + text-banner UI as TPA/Graphs and
+    Tables (confirmed live) - not the click-driven #timer_abcde widget. The
+    number of sub-questions varies per prompt (3 or more), so instead of a
+    fixed count (or asking the user after each one), this watches the page's
+    running count of "Your answer is correct/incorrect" banners and treats
+    any increase as a newly-answered sub-question - comparing counts (rather
+    than just checking "does a banner exist") is what avoids re-reading a
+    stale banner left over from an already-answered sub-question. It stops
+    automatically once no new banner appears for a while.
     """
-    child_count = question.get("msr_child_count", 3)
-    child_difficulties = question.get("msr_child_difficulty_indices", [question["difficulty_index"]] * child_count)
+    fallback_difficulty = question["difficulty_index"]
+    known_difficulties = question.get("msr_child_difficulty_indices", [])
     children: List[Tuple[int, bool]] = []
 
-    for i in range(child_count):
-        print(f"\n--- MSR sub-question {i + 1}/{child_count} ---")
-        # Re-use the real page URL (not a synthetic per-child key) - the
-        # interceptor's guard compares against the live window.location.href,
-        # which doesn't change between MSR sub-question tabs on the same page.
-        set_question_context(driver, question["url"])
-        install_submission_interceptor(driver)
-        was_correct = resolve_single_answer(driver, dump_tag=f"_msr{i}")
-        children.append((child_difficulties[i], was_correct))
-        if i < child_count - 1:
-            input("Press Enter once the next MSR sub-question is visible...")
+    set_question_context(driver, question["url"])
+    install_submission_interceptor(driver)
+
+    print("Watching this page for MSR sub-question submissions "
+          "(answer each one on the page - no need to confirm in between)...")
+
+    deadline = time.monotonic() + ANSWER_WAIT_TIMEOUT_SECONDS
+    last_progress_at = time.monotonic()
+    seen_count = 0
+
+    while time.monotonic() < deadline and len(children) < MSR_MAX_SUBQUESTIONS_SAFETY_CAP:
+        verdicts = read_all_text_verdicts(driver)
+        if len(verdicts) > seen_count:
+            for verdict in verdicts[seen_count:]:
+                idx = len(children)
+                difficulty_index = known_difficulties[idx] if idx < len(known_difficulties) else fallback_difficulty
+                children.append((difficulty_index, verdict["was_correct"]))
+                print(f"Detected sub-question {idx + 1} verdict: "
+                      f"{'CORRECT' if verdict['was_correct'] else 'WRONG'}")
+            seen_count = len(verdicts)
+            last_progress_at = time.monotonic()
+        elif children and (time.monotonic() - last_progress_at) >= MSR_IDLE_TIMEOUT_SECONDS:
+            print(f"No new sub-question detected for {int(MSR_IDLE_TIMEOUT_SECONDS)}s - "
+                  f"assuming this MSR set is complete.")
+            break
+
+        time.sleep(ANSWER_WAIT_POLL_SECONDS)
+
+    if not children:
+        print("Could not auto-detect any MSR sub-question results.")
+        children.append((fallback_difficulty, prompt_manual_correctness()))
 
     return children
 
@@ -587,7 +630,10 @@ def run_question_loop(
             was_correct = all(correct for _, correct in children)
             scorer.record_msr_response(question["category"], children)
         else:
-            was_correct = resolve_single_answer(driver)
+            # TPA and Graphs and Tables use GMAT Club's newer "Submit Answer"
+            # UI (text-banner verdict); DS still uses the click-driven widget.
+            uses_text_verdict_ui = question["category"] in ("Two-Part Analysis", GRAPHS_AND_TABLES_CATEGORY)
+            was_correct = resolve_single_answer(driver, use_text_verdict=uses_text_verdict_ui)
             scorer.record_response(question, was_correct)
 
         stats = scrape_question_stats(driver)
