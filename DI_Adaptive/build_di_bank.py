@@ -1,18 +1,26 @@
 """
 DI_Adaptive/build_di_bank.py — GMAT Focus Edition Data Insights Question Bank Builder
 
-Reads a raw CSV scraped from GMAT Club's Data Insights directory (via the
-Instant Data Scraper Chrome extension), auto-detects the URL/tags columns,
-classifies each question into a 1-8 difficulty band and one of the 4 DI
-categories/subtopics (architecture §3), tags Multi-Source Reasoning threads
-with delivery_type="MSR", generates stable IDs, and writes:
+Unlike Quant's single combined CSV, GMAT Club's DI directory was scraped as 4
+separate per-category exports (DS.csv, MSR.csv, TPA.csv, G&T.csv), each with
+its own (slightly inconsistent) column layout from Instant Data Scraper:
 
-    - questions_di_v1.json      (the question bank, per architecture §2)
-    - gmatclub_clean_di.csv     (cleaned/normalized rows)
+    - URL is in a column containing "href" (e.g. "ttl href").
+    - Difficulty is in the "d" column (e.g. "605-655", "805+", "Sub 505").
+    - For G&T.csv only, the subtopic ("Tables" or "Graphs") is in "tsub 2";
+      the other 3 files don't need a sub-quota-relevant subtopic split.
+
+Since each file IS the category, no keyword-based tag classification is
+needed - the category comes straight from which file a row is in.
+
+Writes:
+    - questions_di_v1.json      (the combined question bank, per architecture §2)
+    - gmatclub_clean_di.csv     (cleaned/normalized rows, all categories combined)
 
 Usage:
-    python build_di_bank.py [--input gmatclub.csv] [--out-json questions_di_v1.json]
-                             [--out-csv gmatclub_clean_di.csv] [--msr-child-count 3]
+    python build_di_bank.py [--ds DS.csv] [--msr MSR.csv] [--tpa TPA.csv] [--gt "G&T.csv"]
+                             [--out-json questions_di_v1.json] [--out-csv gmatclub_clean_di.csv]
+                             [--msr-child-count 3]
 """
 
 from __future__ import annotations
@@ -53,31 +61,27 @@ DIFFICULTY_TAG_PATTERNS: list[tuple[re.Pattern, int]] = [
     (re.compile(r"\b805\s*\+"), 7),
 ]
 
-# Category/subtopic keyword mapping (architecture §3 — DI category table)
-# Order matters: first matching rule wins. "MSRs" also drives delivery_type.
-CATEGORY_RULES: list[tuple[re.Pattern, str, str]] = [
-    (re.compile(r"multi[\s\-]*source\s*reasoning|\bmsr\b", re.IGNORECASE),
-     "MSRs", "Multi-Source Reasoning"),
-    (re.compile(r"two[\s\-]*part\s*analysis|\btpa\b", re.IGNORECASE),
-     "Two-Part Analysis", "Two-Part Analysis"),
-    (re.compile(r"graphics?\s*interpretation", re.IGNORECASE),
-     "Graphs and Tables", "Graphics Interpretation"),
-    (re.compile(r"table\s*analysis", re.IGNORECASE),
-     "Graphs and Tables", "Table Analysis"),
-    (re.compile(r"data\s*sufficiency|\bds\b", re.IGNORECASE),
-     "Data Sufficiency", "Data Sufficiency"),
-]
-
 MSR_CATEGORY = "MSRs"
+GRAPHS_AND_TABLES_CATEGORY = "Graphs and Tables"
 
-DEFAULT_CATEGORY = "Data Sufficiency"
-DEFAULT_SUBTOPIC = "Data Sufficiency"
+# One input file = one fixed category (architecture §3 — DI category table).
+CATEGORY_FILES: dict[str, str] = {
+    "ds": "Data Sufficiency",
+    "msr": MSR_CATEGORY,
+    "tpa": "Two-Part Analysis",
+    "gt": GRAPHS_AND_TABLES_CATEGORY,
+}
 
-# Column name hints for auto-detection
-URL_COLUMN_HINTS = ("topic-link", "href", "url", "link")
-TAG_COLUMN_HINTS = ("tags", "tag")
+# G&T.csv's "tsub 2" values map directly to the official subtopic names.
+GT_SUBTOPIC_MAP = {
+    "tables": "Table Analysis",
+    "graphs": "Graphics Interpretation",
+}
 
-# Rows that look like directory/overview pages rather than actual questions
+URL_COLUMN_HINTS = ("href", "url", "link")
+DIFFICULTY_COLUMN_HINTS = ("d",)
+SUBTOPIC_COLUMN_HINTS = ("tsub 2", "tsub2")
+
 NON_QUESTION_URL_PATTERNS = re.compile(
     r"/forum-\d+\.html$|/(gmat-club|welcome|announcements?)-", re.IGNORECASE
 )
@@ -90,55 +94,29 @@ NON_QUESTION_URL_PATTERNS = re.compile(
 def detect_column(fieldnames: list[str], hints: tuple[str, ...]) -> Optional[str]:
     for hint in hints:
         for name in fieldnames:
+            if name.strip().lower() == hint:
+                return name
+    for hint in hints:
+        for name in fieldnames:
             if hint in name.lower():
                 return name
     return None
-
-
-def detect_columns(fieldnames: list[str]) -> tuple[str, str]:
-    url_col = detect_column(fieldnames, URL_COLUMN_HINTS)
-    tag_col = detect_column(fieldnames, TAG_COLUMN_HINTS)
-    if url_col is None:
-        raise ValueError(
-            f"Could not auto-detect a URL column among headers: {fieldnames}"
-        )
-    if tag_col is None:
-        raise ValueError(
-            f"Could not auto-detect a tags column among headers: {fieldnames}"
-        )
-    return url_col, tag_col
 
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-def _cell_texts(value: str | dict[str, str]) -> list[str]:
-    if isinstance(value, dict):
-        return [str(v or "").strip() for v in value.values() if str(v or "").strip()]
-    text = str(value or "").strip()
-    return [text] if text else []
-
-
-def parse_difficulty(tag_text: str | dict[str, str]) -> Optional[int]:
-    for text in _cell_texts(tag_text):
-        for pattern, band_index in DIFFICULTY_TAG_PATTERNS:
-            if pattern.search(text):
-                return band_index
+def parse_difficulty(text: str) -> Optional[int]:
+    text = (text or "").strip()
+    for pattern, band_index in DIFFICULTY_TAG_PATTERNS:
+        if pattern.search(text):
+            return band_index
     return None
-
-
-def classify_category(tag_text: str | dict[str, str]) -> tuple[str, str]:
-    for text in _cell_texts(tag_text):
-        for pattern, category, subtopic in CATEGORY_RULES:
-            if pattern.search(text):
-                return category, subtopic
-    return DEFAULT_CATEGORY, DEFAULT_SUBTOPIC
 
 
 def normalize_url(url: str) -> str:
     url = url.strip()
-    # strip query params / fragments, trailing slash
     url = url.split("?", 1)[0].split("#", 1)[0]
     return url.rstrip("/")
 
@@ -156,106 +134,144 @@ def is_question_row(url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main build routine
+# Per-file processing
 # ---------------------------------------------------------------------------
 
-def build_bank(input_csv: Path, out_json: Path, out_csv: Path, msr_child_count: int) -> None:
+def process_category_file(
+    input_csv: Path,
+    category: str,
+    msr_child_count: int,
+    seen_urls: set[str],
+) -> tuple[list[dict], list[dict], dict[str, int]]:
+    """Parse one category's CSV export. Returns (questions, clean_rows, skip_counters)."""
+    counters = {"non_question": 0, "no_difficulty": 0, "duplicate": 0}
+    questions: list[dict] = []
+    clean_rows: list[dict] = []
+
     if not input_csv.exists():
-        print(f"Error: input file not found: {input_csv}", file=sys.stderr)
-        sys.exit(1)
+        print(f"  Skipping {category}: file not found ({input_csv})", file=sys.stderr)
+        return questions, clean_rows, counters
 
     with input_csv.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames:
-            print("Error: input CSV has no header row.", file=sys.stderr)
-            sys.exit(1)
-        url_col, tag_col = detect_columns(list(reader.fieldnames))
-        print(f"Detected URL column: '{url_col}'")
-        print(f"Detected tags column: '{tag_col}'")
+            print(f"  Skipping {category}: {input_csv} has no header row.", file=sys.stderr)
+            return questions, clean_rows, counters
 
-        rows = list(reader)
+        fieldnames = list(reader.fieldnames)
+        url_col = detect_column(fieldnames, URL_COLUMN_HINTS)
+        difficulty_col = detect_column(fieldnames, DIFFICULTY_COLUMN_HINTS)
+        subtopic_col = detect_column(fieldnames, SUBTOPIC_COLUMN_HINTS)
 
-    seen_urls: set[str] = set()
-    questions: list[dict] = []
-    clean_rows: list[dict] = []
+        if url_col is None or difficulty_col is None:
+            print(
+                f"  Skipping {category}: could not detect URL/difficulty columns "
+                f"among headers {fieldnames}", file=sys.stderr,
+            )
+            return questions, clean_rows, counters
 
-    skipped_non_question = 0
-    skipped_no_difficulty = 0
-    skipped_duplicate = 0
+        print(f"  {category}: URL column '{url_col}', difficulty column '{difficulty_col}'"
+              + (f", subtopic column '{subtopic_col}'" if subtopic_col else ""))
 
-    for row in rows:
-        raw_url = (row.get(url_col) or "").strip()
-        tag_text = row
-
-        if not is_question_row(raw_url):
-            skipped_non_question += 1
-            continue
-
-        url = normalize_url(raw_url)
-        if url in seen_urls:
-            skipped_duplicate += 1
-            continue
-
-        band_index = parse_difficulty(tag_text)
-        if band_index is None:
-            skipped_no_difficulty += 1
-            continue
-
-        category, subtopic = classify_category(tag_text)
-        band_data = BAND_INFO[band_index]
-        qid = make_id(url)
         is_msr = category == MSR_CATEGORY
+        is_gt = category == GRAPHS_AND_TABLES_CATEGORY
 
-        question = {
-            "id": qid,
-            "url": url,
-            "difficulty_band": band_data["label"],
-            "difficulty_index": band_index,
-            "difficulty_anchor": band_data["anchor"],
-            "category": category,
-            "subtopic": subtopic,
-            "delivery_type": "MSR" if is_msr else "single",
-            "active": True,
-        }
-        if is_msr:
-            # GMAT Club tags an MSR thread with one difficulty label covering
-            # the whole prompt - all sub-questions default to that difficulty
-            # unless a future data source supplies per-child bands.
-            question["msr_child_count"] = msr_child_count
-            question["msr_child_difficulty_indices"] = [band_index] * msr_child_count
+        for row in reader:
+            raw_url = (row.get(url_col) or "").strip()
+            if not is_question_row(raw_url):
+                counters["non_question"] += 1
+                continue
 
-        questions.append(question)
-        seen_urls.add(url)
+            url = normalize_url(raw_url)
+            if url in seen_urls:
+                counters["duplicate"] += 1
+                continue
 
-        clean_rows.append({
-            "id": qid,
-            "url": url,
-            "tags": tag_text,
-            "difficulty_band": band_data["label"],
-            "difficulty_index": band_index,
-            "category": category,
-            "subtopic": subtopic,
-            "delivery_type": question["delivery_type"],
-        })
+            band_index = parse_difficulty(row.get(difficulty_col))
+            if band_index is None:
+                counters["no_difficulty"] += 1
+                continue
 
-    out_json.write_text(json.dumps(questions, indent=2), encoding="utf-8")
+            if is_gt:
+                raw_subtopic = (row.get(subtopic_col) or "").strip().lower()
+                subtopic = GT_SUBTOPIC_MAP.get(raw_subtopic, "Table Analysis")
+            else:
+                subtopic = category
+
+            band_data = BAND_INFO[band_index]
+            qid = make_id(url)
+
+            question = {
+                "id": qid,
+                "url": url,
+                "difficulty_band": band_data["label"],
+                "difficulty_index": band_index,
+                "difficulty_anchor": band_data["anchor"],
+                "category": category,
+                "subtopic": subtopic,
+                "delivery_type": "MSR" if is_msr else "single",
+                "active": True,
+            }
+            if is_msr:
+                # GMAT Club tags an MSR thread with one difficulty label covering
+                # the whole prompt - all sub-questions default to that difficulty
+                # unless a future data source supplies per-child bands.
+                question["msr_child_count"] = msr_child_count
+                question["msr_child_difficulty_indices"] = [band_index] * msr_child_count
+
+            questions.append(question)
+            seen_urls.add(url)
+
+            clean_rows.append({
+                "id": qid,
+                "url": url,
+                "difficulty_band": band_data["label"],
+                "difficulty_index": band_index,
+                "category": category,
+                "subtopic": subtopic,
+                "delivery_type": question["delivery_type"],
+            })
+
+    return questions, clean_rows, counters
+
+
+# ---------------------------------------------------------------------------
+# Main build routine
+# ---------------------------------------------------------------------------
+
+def build_bank(inputs: dict[str, Path], out_json: Path, out_csv: Path, msr_child_count: int) -> None:
+    seen_urls: set[str] = set()
+    all_questions: list[dict] = []
+    all_clean_rows: list[dict] = []
+    totals = {"non_question": 0, "no_difficulty": 0, "duplicate": 0}
+
+    print("Processing category files:")
+    for key, category in CATEGORY_FILES.items():
+        questions, clean_rows, counters = process_category_file(
+            inputs[key], category, msr_child_count, seen_urls
+        )
+        all_questions.extend(questions)
+        all_clean_rows.extend(clean_rows)
+        for k in totals:
+            totals[k] += counters[k]
+        print(f"    -> kept {len(questions)} question(s)")
+
+    out_json.write_text(json.dumps(all_questions, indent=2), encoding="utf-8")
 
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["id", "url", "tags", "difficulty_band", "difficulty_index",
+            fieldnames=["id", "url", "difficulty_band", "difficulty_index",
                         "category", "subtopic", "delivery_type"],
         )
         writer.writeheader()
-        writer.writerows(clean_rows)
+        writer.writerows(all_clean_rows)
 
-    print_stats(questions)
-    print(f"\nParsed rows: {len(rows)}")
-    print(f"  Kept:                {len(questions)}")
-    print(f"  Skipped (non-question row): {skipped_non_question}")
-    print(f"  Skipped (no difficulty tag): {skipped_no_difficulty}")
-    print(f"  Skipped (duplicate URL):     {skipped_duplicate}")
-    print(f"\nWrote {len(questions)} questions to {out_json}")
+    print_stats(all_questions)
+    print(f"\n  Skipped (non-question row): {totals['non_question']}")
+    print(f"  Skipped (no difficulty tag): {totals['no_difficulty']}")
+    print(f"  Skipped (duplicate URL):     {totals['duplicate']}")
+    print(f"\nWrote {len(all_questions)} questions to {out_json}")
     print(f"Wrote cleaned CSV to {out_csv}")
 
 
@@ -279,14 +295,19 @@ def print_stats(questions: list[dict]) -> None:
     for (category, subtopic), count in sorted(subtopic_counts.items()):
         print(f"  {category} / {subtopic}: {count}")
 
-    print(f"\n--- Delivery Type ---")
+    print("\n--- Delivery Type ---")
     print(f"  MSR prompts: {msr_count}")
     print(f"  Single questions: {len(questions) - msr_count}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the GMAT Data Insights question bank from a GMAT Club CSV export.")
-    parser.add_argument("--input", default="gmatclub.csv", help="Path to the raw scraped CSV (default: gmatclub.csv)")
+    parser = argparse.ArgumentParser(
+        description="Build the GMAT Data Insights question bank from 4 per-category GMAT Club CSV exports."
+    )
+    parser.add_argument("--ds", default="DS.csv", help="Data Sufficiency CSV (default: DS.csv)")
+    parser.add_argument("--msr", default="MSR.csv", help="MSR CSV (default: MSR.csv)")
+    parser.add_argument("--tpa", default="TPA.csv", help="Two-Part Analysis CSV (default: TPA.csv)")
+    parser.add_argument("--gt", default="G&T.csv", help="Graphs and Tables CSV (default: G&T.csv)")
     parser.add_argument("--out-json", default="questions_di_v1.json", help="Output JSON bank path")
     parser.add_argument("--out-csv", default="gmatclub_clean_di.csv", help="Output cleaned CSV path")
     parser.add_argument("--msr-child-count", type=int, default=3,
@@ -296,4 +317,5 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    build_bank(Path(args.input), Path(args.out_json), Path(args.out_csv), args.msr_child_count)
+    inputs = {"ds": Path(args.ds), "msr": Path(args.msr), "tpa": Path(args.tpa), "gt": Path(args.gt)}
+    build_bank(inputs, Path(args.out_json), Path(args.out_csv), args.msr_child_count)
