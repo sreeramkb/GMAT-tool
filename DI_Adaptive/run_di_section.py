@@ -60,7 +60,7 @@ from engine.dom_scraper import (  # noqa: E402
     scrape_question_stats,
     set_question_context,
 )
-from engine.hud_overlay import inject_hud, read_review_list  # noqa: E402
+from engine.hud_overlay import inject_hud, read_review_list, read_timer_pause_state  # noqa: E402
 from engine.exclusion import (  # noqa: E402
     UsedQuestionLedger,
     build_exclusion_set,
@@ -431,7 +431,23 @@ def wait_for_answer(driver, dump_tag: str = "", use_text_verdict: bool = False) 
     pending_since: Optional[float] = None
     announced_selection = False
 
-    while time.monotonic() < deadline:
+    paused_total = 0.0
+    paused_since = None
+
+    while True:
+        now = time.monotonic()
+        if read_timer_pause_state(driver):
+            if paused_since is None:
+                paused_since = now
+        else:
+            if paused_since is not None:
+                paused_total += now - paused_since
+                paused_since = None
+
+        effective_deadline = deadline + paused_total
+        if now >= effective_deadline:
+            break
+
         if use_text_verdict:
             # Two-Part Analysis uses GMAT Club's newer "Submit Answer" format,
             # which reveals correctness as a plain text banner rather than via
@@ -476,7 +492,7 @@ def wait_for_answer(driver, dump_tag: str = "", use_text_verdict: bool = False) 
             return pending_result
 
         if elapsed % 10 < ANSWER_WAIT_POLL_SECONDS:
-            remaining = max(0, int(deadline - time.monotonic()))
+            remaining = max(0, int(effective_deadline - time.monotonic()))
             print(f"Waiting for answer... {remaining}s remaining")
 
         time.sleep(ANSWER_WAIT_POLL_SECONDS)
